@@ -97,8 +97,10 @@ void replyToConfig(const IncomingConfig& incoming) {
         if (!ffheater::validConfig(incoming.frame)) {
             reply.status = ffheater::CONFIG_BAD_VALUE;
         } else {
-            StoredSettings next{incoming.frame.roomTenths, incoming.frame.ductTenths,
-                                incoming.frame.sleepSeconds, 0x5353};
+            StoredSettings next{};
+            next.roomTenths = incoming.frame.roomTenths;
+            next.ductTenths = incoming.frame.ductTenths;
+            next.sleepSeconds = incoming.frame.sleepSeconds;
             if (!saveSettings(next)) reply.status = ffheater::CONFIG_SAVE_ERROR;
         }
     }
