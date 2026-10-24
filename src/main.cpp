@@ -86,6 +86,8 @@ void OnConfigRecv(const uint8_t* mac, const uint8_t* bytes, int len) {
     memcpy(received.sourceMac, mac, 6);
     xQueueSend(configQueue, &received, 0);
 }
+std::atomic<bool> sendCompleted{false};
+std::atomic<esp_now_send_status_t> sendStatus{ESP_NOW_SEND_FAIL};
 void replyToConfig(const IncomingConfig& incoming) {
     ffheater::ConfigFrame reply{};
     reply.op = ffheater::CONFIG_REPORT;
@@ -109,8 +111,7 @@ void replyToConfig(const IncomingConfig& incoming) {
     while (!sendCompleted.load() && millis() - started < 300) delay(5);
 }
 
-std::atomic<bool> sendCompleted{false};
-std::atomic<esp_now_send_status_t> sendStatus{ESP_NOW_SEND_FAIL};
+
 
 // ==================== 関数定義 ====================
 void blink(int count) {
