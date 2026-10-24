@@ -41,10 +41,9 @@ jobs:
           cp ".pio/build/sensor/partitions.bin" "$OUT/partitions_0x8000.bin"
           FW="$HOME/.platformio/packages/framework-arduinoespressif32"
           test -d "$FW"
-          BOOTLOADER="$(find "$FW" -type f -name 'bootloader_dio_40m.bin' -print -quit)"
           BOOTAPP="$(find "$FW" -type f -name 'boot_app0.bin' -print -quit)"
-          test -n "$BOOTLOADER" && test -n "$BOOTAPP"
-          cp "$BOOTLOADER" "$OUT/bootloader_0x1000.bin"
+          if [ -z "$BOOTAPP" ]; then echo 'boot_app0.bin missing'; exit 1; fi
+          cp ".pio/build/sensor/bootloader.bin" "$OUT/bootloader_0x1000.bin"
           cp "$BOOTAPP" "$OUT/boot_app0_0xe000.bin"
           cat > "$OUT/FLASH_INSTRUCTIONS.txt" <<'EOF'
           Browser flashing (ESP32 classic, esp32dev):
