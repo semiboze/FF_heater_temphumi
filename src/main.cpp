@@ -4,10 +4,13 @@
 #include <WiFi.h>
 #include <DHT.h>
 #include <atomic>
+#include <Preferences.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include "SensorConfig.h"
 #include <math.h>
 
 // ==================== 設定エリア ====================
-#define SLEEP_DURATION_SEC 60
 constexpr uint8_t ESPNOW_CHANNEL = 1;
 constexpr uint8_t SENSOR_READ_ATTEMPTS = 3;
 // DHTライブラリの読み取りキャッシュ（2秒）より長く待って再測定する。
@@ -35,6 +38,76 @@ SensorData sensorData = {1, NAN, NAN, NAN, NAN, NAN};
 DHT dhtRoom(PIN_DHT_ROOM, DHT11);
 DHT dhtDuct(PIN_DHT_DUCT, DHT11);
 #define LED_PIN 2
+
+
+struct StoredSettings {
+    int16_t roomTenths = 0;
+    int16_t ductTenths = 0;
+    uint16_t sleepSeconds = 60;
+    uint16_t marker = 0x5353;
+};
+struct IncomingConfig {
+    ffheater::ConfigFrame frame;
+    uint8_t sourceMac[6];
+};
+StoredSettings sensorSettings;
+QueueHandle_t configQueue = nullptr;
+Preferences sensorPrefs;
+
+bool validStored(const StoredSettings& saved) {
+    ffheater::ConfigFrame frame{};
+    frame.roomTenths = saved.roomTenths;
+    frame.ductTenths = saved.ductTenths;
+    frame.sleepSeconds = saved.sleepSeconds;
+    return saved.marker == 0x5353 && ffheater::validConfig(frame);
+}
+void loadSettings() {
+    sensorPrefs.begin("sensor-config", false);
+    StoredSettings saved{};
+    if (sensorPrefs.getBytesLength("settings") == sizeof(saved) &&
+        sensorPrefs.getBytes("settings", &saved, sizeof(saved)) == sizeof(saved) &&
+        validStored(saved)) sensorSettings = saved;
+}
+bool saveSettings(const StoredSettings& next) {
+    if (!validStored(next)) return false;
+    if (memcmp(&next, &sensorSettings, sizeof(next)) == 0) return true;
+    if (sensorPrefs.putBytes("settings", &next, sizeof(next)) != sizeof(next)) return false;
+    StoredSettings readback{};
+    if (sensorPrefs.getBytes("settings", &readback, sizeof(readback)) != sizeof(readback) ||
+        memcmp(&readback, &next, sizeof(next)) != 0) return false;
+    sensorSettings = next;
+    return true;
+}
+void OnConfigRecv(const uint8_t* mac, const uint8_t* bytes, int len) {
+    if (!mac || !configQueue || memcmp(mac, broadcastAddress, 6) != 0) return;
+    IncomingConfig received{};
+    if (!ffheater::decodeConfig(bytes, len, received.frame) ||
+        (received.frame.op != ffheater::CONFIG_GET && received.frame.op != ffheater::CONFIG_SET)) return;
+    memcpy(received.sourceMac, mac, 6);
+    xQueueSend(configQueue, &received, 0);
+}
+void replyToConfig(const IncomingConfig& incoming) {
+    ffheater::ConfigFrame reply{};
+    reply.op = ffheater::CONFIG_REPORT;
+    reply.requestId = incoming.frame.requestId;
+    reply.status = ffheater::CONFIG_OK;
+    if (incoming.frame.op == ffheater::CONFIG_SET) {
+        if (!ffheater::validConfig(incoming.frame)) {
+            reply.status = ffheater::CONFIG_BAD_VALUE;
+        } else {
+            StoredSettings next{incoming.frame.roomTenths, incoming.frame.ductTenths,
+                                incoming.frame.sleepSeconds, 0x5353};
+            if (!saveSettings(next)) reply.status = ffheater::CONFIG_SAVE_ERROR;
+        }
+    }
+    reply.roomTenths = sensorSettings.roomTenths;
+    reply.ductTenths = sensorSettings.ductTenths;
+    reply.sleepSeconds = sensorSettings.sleepSeconds;
+    sendCompleted.store(false);
+    esp_now_send(incoming.sourceMac, reinterpret_cast<const uint8_t*>(&reply), sizeof(reply));
+    const uint32_t started = millis();
+    while (!sendCompleted.load() && millis() - started < 300) delay(5);
+}
 
 std::atomic<bool> sendCompleted{false};
 std::atomic<esp_now_send_status_t> sendStatus{ESP_NOW_SEND_FAIL};
@@ -93,6 +166,10 @@ void readSensors() {
         }
     }
 
+    // Preserve NaN; only finite temperatures receive calibration offsets.
+    if (isfinite(sensorData.roomTemp)) sensorData.roomTemp += sensorSettings.roomTenths / 10.0f;
+    if (isfinite(sensorData.ductTemp)) sensorData.ductTemp += sensorSettings.ductTenths / 10.0f;
+
     // 非有限値はすべて NAN に統一し、親機が項目ごとに異常を判別できるようにする。
     if (!isfinite(sensorData.roomTemp)) sensorData.roomTemp = NAN;
     if (!isfinite(sensorData.roomHum)) sensorData.roomHum = NAN;
@@ -102,8 +179,10 @@ void readSensors() {
 
 void setup() {
     Serial.begin(115200);
-    // 初期化・送信に失敗した場合も必ず60秒後に再起床する。
-    esp_sleep_enable_timer_wakeup(uint64_t(SLEEP_DURATION_SEC) * 1000000ULL);
+    loadSettings();
+    configQueue = xQueueCreate(2, sizeof(IncomingConfig));
+    // The configured interval applies even on initialization/measurement failure.
+    esp_sleep_enable_timer_wakeup(uint64_t(sensorSettings.sleepSeconds) * 1000000ULL);
 
     blink(3); // 起床時の3回点滅
 
@@ -126,6 +205,11 @@ void setup() {
         return;
     }
 
+    if (!configQueue || esp_now_register_recv_cb(OnConfigRecv) != ESP_OK) {
+        Serial.println("Failed to register config receiver");
+        sleepNow();
+        return;
+    }
     if (esp_now_register_send_cb(OnDataSent) != ESP_OK) {
         Serial.println("Failed to register ESP-NOW callback");
         sleepNow();
@@ -167,6 +251,18 @@ void setup() {
     } else {
         Serial.println("ESP-NOW send callback timed out");
     }
+    // ESP-NOW is unavailable during deep sleep. Keep a bounded receive window
+    // after the temperature packet so the parent can return a pending command.
+    // A failed configuration exchange never prevents the next temperature sample.
+    const uint32_t listenAt = millis();
+    while (millis() - listenAt < 1000) {
+        IncomingConfig incoming{};
+        if (xQueueReceive(configQueue, &incoming, pdMS_TO_TICKS(25)) == pdTRUE) {
+            replyToConfig(incoming);
+            break;
+        }
+    }
+    esp_sleep_enable_timer_wakeup(uint64_t(sensorSettings.sleepSeconds) * 1000000ULL);
     sleepNow();
 }
 
