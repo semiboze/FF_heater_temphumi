@@ -1,0 +1,68 @@
+name: Build ESP32 firmware (browser flashing)
+
+on:
+  push:
+    branches:
+      - feature/sensor-config-v05-20261024
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'test/**'
+      - 'platformio.ini'
+      - '.github/workflows/build-firmware.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install PlatformIO
+        run: python -m pip install --upgrade platformio
+      - name: Run native protocol tests
+        run: |
+          g++ -std=c++17 -Iinclude test/sensor_config_test.cpp -o /tmp/config-test
+          /tmp/config-test
+      - name: Build firmware
+        run: pio run -e sensor
+      - name: Prepare browser-flashing binaries
+        run: |
+          set -euo pipefail
+          OUT="flash-files"
+          mkdir -p "$OUT"
+          cp ".pio/build/sensor/firmware.bin" "$OUT/firmware_0x10000.bin"
+          cp ".pio/build/sensor/partitions.bin" "$OUT/partitions_0x8000.bin"
+          FW="$HOME/.platformio/packages/framework-arduinoespressif32"
+          test -d "$FW"
+          BOOTLOADER="$(find "$FW" -type f -name 'bootloader_dio_40m.bin' -print -quit)"
+          BOOTAPP="$(find "$FW" -type f -name 'boot_app0.bin' -print -quit)"
+          test -n "$BOOTLOADER" && test -n "$BOOTAPP"
+          cp "$BOOTLOADER" "$OUT/bootloader_0x1000.bin"
+          cp "$BOOTAPP" "$OUT/boot_app0_0xe000.bin"
+          cat > "$OUT/FLASH_INSTRUCTIONS.txt" <<'EOF'
+          Browser flashing (ESP32 classic, esp32dev):
+          https://espressif.github.io/esp-launchpad/
+          Open DIY, connect the ESP32 via USB, then add these exact files/address pairs:
+            0x1000  bootloader_0x1000.bin
+            0x8000  partitions_0x8000.bin
+            0xE000  boot_app0_0xe000.bin
+            0x10000 firmware_0x10000.bin
+          Do not use 'Erase Flash' if you want to retain Preferences/NVS.
+          Disconnect the FF heater button interface during first hardware checks.
+          This is TEST firmware: flash only after both parent and child builds pass.
+          EOF
+          ls -lah "$OUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sensor-esp32dev-browser-flash
+          path: flash-files/
+          if-no-files-found: error
+          retention-days: 14
